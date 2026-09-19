@@ -7,8 +7,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .segmenter import Config, solve
+from .terminology import review
 
-app = FastAPI(title="字幕断句", version="1.3.0")
+app = FastAPI(title="字幕断句", version="1.4.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -54,6 +55,42 @@ def segment(req: SegmentRequest):
                      boundaries=[b.model_dump() for b in req.boundaries],
                      alternatives=req.alternatives,
                      locks=[lk.model_dump() for lk in req.locks])
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+class TermIn(BaseModel):
+    """术语表条目: canonical 为规范写法, variants 为多个识别变体(大小写/全半角
+    经 NFKC + 大小写归一后视为同一识别串)。"""
+    canonical: str = ""
+    variants: list[str] = Field(default_factory=list)
+
+
+class ReviewSegmentIn(BaseModel):
+    """参与审校的断句方案段: 仅需段的词下标范围 [首词, 末词](含端点)。"""
+    word_range: list[int] = Field(min_length=2, max_length=2)
+
+
+class ReviewRequest(BaseModel):
+    words: list[WordIn]
+    segments: list[ReviewSegmentIn]
+    terms: list[TermIn]
+
+
+@app.post("/api/review")
+def review_terms(req: ReviewRequest):
+    """术语一致性审校: 对当前选中断句方案的各段收集术语命中。
+
+    段范围必须按词下标递增、互不重叠(首尾相接允许); 术语表问题(空规范词、
+    变体归属冲突)返回 200 + {"ok": false, "error": {...}}, 回显术语序号与
+    完整术语表输入, 供页面保留输入。
+    """
+    try:
+        return review(
+            [w.model_dump() for w in req.words],
+            [s.word_range for s in req.segments],
+            [t.model_dump() for t in req.terms],
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 

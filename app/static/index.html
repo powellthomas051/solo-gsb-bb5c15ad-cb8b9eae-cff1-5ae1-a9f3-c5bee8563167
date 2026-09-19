@@ -85,6 +85,25 @@
   .locklist button { padding:2px 9px; font-size:11px; background:transparent; border:1px solid var(--border); color:var(--dim); }
   .locknote { color:var(--dim); font-size:11px; margin-top:6px; line-height:1.5; }
   .altlegend { display:flex; gap:14px; align-items:center; font-size:11px; color:var(--dim); margin:2px 0 10px; flex-wrap:wrap; }
+  /* 术语一致性审校 */
+  :root { --term-ok:#34c98e; --term-bad:#f5a524; }
+  #terms { font-size:12px; }
+  .review { border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:12px; }
+  .review .rhead { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:13px; margin-bottom:6px; }
+  .review .rhead b { font-size:15px; }
+  .review.ok { border-color:var(--term-ok); }
+  .review.hasbad { border-color:var(--term-bad); }
+  .review.err { border-color:var(--bad); background:#2a1518; }
+  .review .okn { color:var(--term-ok); font-weight:600; }
+  .review .badn { color:var(--term-bad); font-weight:600; }
+  .review table { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
+  .review th, .review td { border-top:1px solid var(--border); padding:4px 8px; text-align:left; }
+  .review th { color:var(--dim); font-weight:600; }
+  .review td.bad { color:var(--term-bad); }
+  .review .rerr { color:var(--bad); font-size:12px; white-space:pre-wrap; margin-top:4px; }
+  mark.tok { background:transparent; border-radius:3px; padding:0 2px; }
+  mark.tok.canonical { background:rgba(52,201,142,.28); box-shadow:0 0 0 1px var(--term-ok) inset; }
+  mark.tok.variant { background:rgba(245,165,36,.30); box-shadow:0 0 0 1px var(--term-bad) inset; }
 </style>
 </head>
 <body>
@@ -123,6 +142,13 @@
     </div>
 
     <div class="panel">
+      <h2>术语表 · 术语一致性审校</h2>
+      <textarea id="terms" rows="4" spellcheck="false" placeholder="动态规划 = DP | ｄｐ
+人工智能 = AI"></textarea>
+      <div class="hint">每行一个术语:<code>规范写法 = 识别变体1 | 识别变体2 …</code>。审校先做 NFKC 与大小写归一,故 <code>DP</code>/<code>dp</code>/<code>ＤＰ</code> 视为同一识别串;命中可跨词但不跨字幕段,嵌套/重叠命中按「覆盖字符最多、变体最少、再按录入顺序」唯一选取。空规范词或同一识别串归属多个术语时,返回术语序号并保留输入。</div>
+    </div>
+
+    <div class="panel">
       <h2>镜头切点</h2>
       <textarea id="shots" rows="3" spellcheck="false" placeholder="00:00:04.500
 8.2"></textarea>
@@ -152,6 +178,7 @@
     <div class="panel">
       <h2>断句预览</h2>
       <div class="hint" style="margin-bottom:8px">点击段落右上角 <b>🔒 锁定</b> 可固定该段的词范围与内部换行;之后调整权重、边界约束或备选数量时,后端只优化其余区间,跨区间的 K-best 组合仍按全局总代价排序、按完整断点序列去重。再次点击可解锁。</div>
+      <div id="reviewPanel"></div>
       <div id="result"><span class="hint">粘贴词序列后自动计算。</span></div>
     </div>
   </div>
@@ -357,6 +384,7 @@ async function run() {
     $("parseError").textContent = e.message;
     $("result").innerHTML = "";
     renderWordFlow([], []);
+    resetReview();
     return;
   }
   // 短语/切点解析失败时保留词序列与边界标记,仅提示错误
@@ -368,7 +396,12 @@ async function run() {
     $("parseError").textContent = e.message;
   }
   renderWordFlow(words, phrases);
-  if (!words.length) { $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>'; return; }
+  if (!words.length) {
+    $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>';
+    resetReview();
+    return;
+  }
+  lastWords = words;
 
   const cfg = {};
   for (const k of ["max_chars_per_line", "max_cps", "min_duration", "max_duration", "w_shot", "w_imbalance", "w_pause"])
@@ -393,7 +426,11 @@ async function run() {
     body: JSON.stringify({ words, phrases, shots, boundaries, locks, alternatives, config: cfg }),
   });
   const data = await res.json();
-  if (!res.ok) { $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`; return; }
+  if (!res.ok) {
+    $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`;
+    resetReview();
+    return;
+  }
   render(data);
 }
 
@@ -401,6 +438,173 @@ async function run() {
 let curData = null;
 let altPlans = null;
 let altIndex = 0;
+
+// ===== 术语一致性审校 =====
+// 最近一次断句成功的词序列、当前展示段; reviewData 为最近一次审校响应
+let lastWords = [];
+let curSegments = [];
+let reviewData = null;
+let reviewReqSeq = 0;
+let lastReviewKey = "";  // 已完成审校的(段签名 + 术语文本), 未变则不重复请求
+let reviewTimer = null;
+
+function resetReview() {
+  lastWords = [];
+  curSegments = [];
+  reviewData = null;
+  lastReviewKey = "";
+  reviewReqSeq++;
+  $("reviewPanel").innerHTML = "";
+}
+
+function scheduleReview() {
+  // 定时器异步触发: 键未变时 runReview 在触达任何渲染前即返回, 不会形成递归
+  clearTimeout(reviewTimer);
+  reviewTimer = setTimeout(runReview, 250);
+}
+
+function parseTerms(text) {
+  // 每行: 规范写法 = 变体1 | 变体2 …; 无 '=' 时视为无变体的术语; 整行空白忽略
+  return text.split("\n").map(l => l.trimEnd()).filter(l => l.trim()).map(line => {
+    const eq = line.indexOf("=");
+    if (eq === -1) return { canonical: line.trim(), variants: [] };
+    const canonical = line.slice(0, eq).trim();
+    const variants = line.slice(eq + 1).split("|").map(s => s.trim()).filter(Boolean);
+    return { canonical, variants };
+  });
+}
+
+async function runReview() {
+  const terms = parseTerms($("terms").value);
+  const segSig = JSON.stringify(curSegments.map(s => s.word_range));
+  const key = segSig + "\n" + $("terms").value;
+  if (key === lastReviewKey) return;  // 段方案与术语表均未变化
+  const seq = ++reviewReqSeq;
+  if (!terms.length || !curSegments.length) {
+    const hadReview = reviewData !== null;
+    reviewData = null;
+    lastReviewKey = key;  // 空状态同样缓存: 词表或段变化时 key 自然不同
+    $("reviewPanel").innerHTML = "";
+    // 仅在此前确有高亮时重绘; renderPlan 自身又会调度审校, 凭缓存键立即返回
+    if (hadReview && curData && curData.ok) renderPlan(altIndex);
+    return;
+  }
+  const res = await fetch("/api/review", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      words: lastWords,
+      segments: curSegments.map(s => ({ word_range: s.word_range })),
+      terms,
+    }),
+  });
+  const data = await res.json();
+  if (seq !== reviewReqSeq) return;  // 已被更新的请求取代
+  lastReviewKey = key;  // 含 HTTP 错误: 术语/段未变时不重试, 修改后键变化自动重发
+  if (!res.ok) {
+    reviewData = null;
+    $("reviewPanel").innerHTML =
+      `<div class="review err"><b>术语审校失败</b><div class="rerr">${escapeHtml(String(data.detail || "请求失败"))}</div></div>`;
+    renderPlan(altIndex);
+    return;
+  }
+  reviewData = data;
+  renderReview();
+  renderPlan(altIndex);
+}
+
+function reviewSegAt(segIndex) {
+  // 按段序号对应: 审校针对当前段序列; 方案切换触发重审, 旧结果只作过渡
+  if (!reviewData || !reviewData.ok) return null;
+  const rs = reviewData.segments[segIndex];
+  return rs && rs.index === segIndex ? rs : null;
+}
+
+function hitTitle(h) {
+  return h.kind === "canonical"
+    ? `规范写法「${h.canonical}」`
+    : `不一致: 变体「${h.variant}」应写作「${h.canonical}」`;
+}
+
+function lineWordsHtml(s, segIndex) {
+  // 按段 line_break 把段词分两行, 用审校命中(词粒度)包裹高亮
+  const [wa, wb] = s.word_range;
+  const lb = s.line_break == null ? null : s.line_break;
+  const rseg = reviewSegAt(segIndex);
+  const hitOf = new Map();  // 词下标 -> 命中
+  if (rseg) for (const h of rseg.hits)
+    for (let w = h.word_range[0]; w <= h.word_range[1]; w++) hitOf.set(w, h);
+  const rows = [];
+  let cur = [];
+  const flush = () => { rows.push(cur); cur = []; };
+  for (let wi = wa; wi <= wb; wi++) {
+    if (lb != null && wi === lb) flush();
+    cur.push(wi);
+  }
+  flush();
+  return rows.map(row => row.map(wi => {
+    const h = hitOf.get(wi);
+    const txt = escapeHtml(lastWords[wi] ? lastWords[wi].text : "");
+    return h ? `<mark class="tok ${h.kind}" title="${escapeHtml(hitTitle(h))}">${txt}</mark>` : txt;
+  }).join(" "));
+}
+
+function renderReview() {
+  const el = $("reviewPanel");
+  const d = reviewData;
+  if (!d) { el.innerHTML = ""; return; }
+  if (!d.ok) {
+    const e = d.error;
+    let msg;
+    if (e.kind === "empty_canonical") {
+      msg = `第 <b>${e.term_index}</b> 个术语的规范写法为空,请补充后重审(输入已保留)。`;
+    } else if (e.kind === "variant_conflict") {
+      msg = `识别串「${escapeHtml(e.pattern)}」同时归属第 <b>${e.owner_index}</b> 个术语与第 <b>${e.term_index}</b> 个术语,术语间不得共用同一识别串,请修正后重审(输入已保留)。`;
+    } else {
+      msg = escapeHtml(e.kind);
+    }
+    el.innerHTML = `<div class="review err"><b>术语表有误 — 审校未执行</b><div class="rerr">${msg}</div></div>`;
+    return;
+  }
+  const hasBad = d.variant_count > 0;
+  const rows = d.terms.map(t => {
+    const bad = t.variant_count > 0;
+    const vlist = t.variants.map(v => `${escapeHtml(v.variant)} ×${v.count}`).join(", ");
+    return `<tr>
+      <td>${t.term_index}</td>
+      <td>${escapeHtml(t.canonical)}</td>
+      <td>${t.canonical_count}</td>
+      <td class="${bad ? "bad" : ""}">${t.variant_count}${vlist ? ` <span class="hint" style="margin:0">(${vlist})</span>` : ""}</td>
+    </tr>`;
+  }).join("");
+  const table = d.terms.length
+    ? `<table><tr><th>#</th><th>规范写法</th><th>规范次数</th><th>变体次数(不一致)</th></tr>${rows}</table>`
+    : `<div class="hint" style="margin-top:6px">当前术语表在选中断句方案中没有任何命中。</div>`;
+  el.innerHTML = `<div class="review ${hasBad ? "hasbad" : "ok"}">
+    <div class="rhead">
+      <span>术语审校</span>
+      <span>命中 <b>${d.hit_count}</b></span>
+      <span class="okn">规范 ${d.canonical_count}</span>
+      <span class="badn">变体/不一致 ${d.variant_count}</span>
+      <button type="button" class="ghost" id="downloadReview" style="margin-left:auto">下载审校 JSON</button>
+    </div>
+    ${hasBad ? `<div class="hint" style="margin:0 0 2px">存在不一致术语:<b>${d.inconsistent.join(", ")}</b> 号;预览中绿色为规范写法、橙色为变体命中。</div>`
+             : `<div class="hint" style="margin:0 0 2px">全部命中均为规范写法。预览中绿色为规范命中。</div>`}
+    ${table}
+  </div>`;
+}
+
+$("reviewPanel").addEventListener("click", e => {
+  if (e.target.closest("#downloadReview") && reviewData && reviewData.ok) {
+    const blob = new Blob([JSON.stringify(reviewData, null, 2)],
+                          { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "terminology-review.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+});
 
 function planBreakSet(segments) {
   // 词间隙断点集合: 每段首词下标(0 除外)即其左侧间隙
@@ -456,6 +660,7 @@ function render(data) {
   const el = $("result");
   if (!data.ok) {
     clearBreakMarks();
+    resetReview();
     const c = data.conflict;
     const b = c.boundary;
     const btxt = b
@@ -497,6 +702,8 @@ function renderPlan(idx) {
   const multi = altPlans && altPlans.length > 1;
   const bestSet = multi ? planBreakSet(altPlans[0].segments) : null;
   markPlanBreaks(segments, bestSet);
+  curSegments = segments;  // 供术语审校使用: 始终对当前选中断句方案审校
+  scheduleReview();
 
   let switcher = "";
   let legend = "";
@@ -540,7 +747,7 @@ function renderPlan(idx) {
       return `<div class="seg${diff ? " diffbreak" : ""}${isLocked ? " locked" : ""}">
       <div class="meta"><span>#${i + 1}</span><span>${fmt(s.start)} → ${fmt(s.end)}</span>
         <span>${s.duration}s</span><span>${s.cps} 字/秒</span><span>词 ${wa}–${wb}</span>${tag}${ltag}${lockBtn}</div>
-      <div class="lines">${s.lines.map(l => `<div>${escapeHtml(l)}</div>`).join("<br>")}</div>
+      <div class="lines">${lineWordsHtml(s, i).map(l => `<div>${l}</div>`).join("<br>")}</div>
       <div class="cost"><span>镜头 <b>${s.cost.shot}</b></span><span>行长 <b>${s.cost.imbalance}</b></span>
         <span>停顿 <b>${s.cost.pause}</b></span><span>合计 <b>${s.cost.total}</b></span></div>
     </div>`;
@@ -567,10 +774,12 @@ $("fillExample").onclick = () => {
   $("words").value = EXAMPLE;
   $("phrases").value = "动态规划";
   $("shots").value = "00:00:04.500\n00:00:08.000";
+  $("terms").value = "动态规划 = DP | ｄｐ";
   schedule();
 };
 
 for (const id of ["words", "phrases", "shots", "alternatives"]) $(id).addEventListener("input", schedule);
+$("terms").addEventListener("input", scheduleReview);
 for (const id of ["max_chars_per_line", "max_cps", "min_duration", "max_duration"]) $(id).addEventListener("input", schedule);
 for (const id of ["w_shot", "w_imbalance", "w_pause"]) $(id).addEventListener("input", () => {
   $(id + "_v").textContent = parseFloat($(id).value).toFixed(1);
