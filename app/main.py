@@ -7,8 +7,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .segmenter import Config, solve
+from .terminology import TermError, review_terms
 
-app = FastAPI(title="字幕断句", version="1.3.0")
+app = FastAPI(title="字幕断句", version="1.4.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -45,6 +46,24 @@ class SegmentRequest(BaseModel):
     config: dict = Field(default_factory=dict)
 
 
+class TermIn(BaseModel):
+    """术语表条目: canonical 为规范写法, variants 为多个识别变体(录入原文)。"""
+    canonical: str
+    variants: list[str] = Field(default_factory=list)
+
+
+class ReviewSegmentIn(BaseModel):
+    """当前选中的断句方案中的一段: 词范围与段内换行(词间隙下标, null=单行)。"""
+    word_range: list[int] = Field(min_length=2, max_length=2)
+    line_break: int | None = None
+
+
+class ReviewRequest(BaseModel):
+    words: list[WordIn]
+    segments: list[ReviewSegmentIn]
+    terms: list[TermIn] = Field(default_factory=list)
+
+
 @app.post("/api/segment")
 def segment(req: SegmentRequest):
     cfg_fields = {k: v for k, v in req.config.items() if k in Config.__dataclass_fields__}
@@ -54,6 +73,20 @@ def segment(req: SegmentRequest):
                      boundaries=[b.model_dump() for b in req.boundaries],
                      alternatives=req.alternatives,
                      locks=[lk.model_dump() for lk in req.locks])
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/api/terms/review")
+def terms_review(req: ReviewRequest):
+    try:
+        return review_terms(
+            [w.model_dump() for w in req.words],
+            [s.model_dump() for s in req.segments],
+            [t.model_dump() for t in req.terms],
+        )
+    except TermError as e:
+        raise HTTPException(status_code=422, detail=e.payload)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 

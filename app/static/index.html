@@ -85,6 +85,26 @@
   .locklist button { padding:2px 9px; font-size:11px; background:transparent; border:1px solid var(--border); color:var(--dim); }
   .locknote { color:var(--dim); font-size:11px; margin-top:6px; line-height:1.5; }
   .altlegend { display:flex; gap:14px; align-items:center; font-size:11px; color:var(--dim); margin:2px 0 10px; flex-wrap:wrap; }
+  /* 术语一致性审校 */
+  mark.tm { background:rgba(52,201,142,.28); color:var(--fg); border:1px solid rgba(52,201,142,.7); border-radius:3px; padding:0 1px; }
+  mark.tm.var { background:rgba(249,112,102,.26); border-color:rgba(249,112,102,.75); }
+  .trsum { display:flex; gap:10px; flex-wrap:wrap; font-size:12px; margin:8px 0; }
+  .trsum .chip { background:#101216; border:1px solid var(--border); border-radius:6px; padding:4px 10px; color:var(--dim); }
+  .trsum .chip b { color:var(--fg); }
+  .trsum .chip.ok b { color:var(--ok); }
+  .trsum .chip.bad b { color:var(--bad); }
+  .termtbl { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
+  .termtbl th, .termtbl td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); color:var(--dim); }
+  .termtbl th { font-weight:600; }
+  .termtbl td b { color:var(--fg); font-weight:600; }
+  .termtbl .v { color:var(--bad); }
+  .trlist { margin:6px 0 0; padding:0; list-style:none; font-size:12px; }
+  .trlist li { background:#101216; border:1px solid var(--border); border-radius:6px; padding:6px 10px; margin-top:6px; cursor:pointer; }
+  .trlist li:hover { border-color:var(--accent); }
+  .trlist .vr { color:var(--bad); font-weight:600; }
+  .trlist .ar { color:var(--ok); font-weight:600; }
+  .seg.flash { animation:segflash 1.4s ease; }
+  @keyframes segflash { 0%, 60% { box-shadow:0 0 0 2px var(--accent) inset; } 100% { box-shadow:0 0 0 0 transparent inset; } }
 </style>
 </head>
 <body>
@@ -130,6 +150,17 @@
     </div>
 
     <div class="panel">
+      <h2>术语表(一致性审校)</h2>
+      <textarea id="glossary" rows="5" spellcheck="false" placeholder="Wi-Fi = WiFi, wifi, WI-FI
+人工智能 = 人工智慧"></textarea>
+      <div class="hint">每行一个术语:<code>规范写法 = 变体1 / 变体2…</code>(分隔符支持 <code>=</code> 或 <code>:</code>,变体可用逗号/分号/竖线分隔,空白变体忽略);也接受 JSON 数组 <code>[{"canonical","variants"}]</code>。匹配先做 NFKC 与大小写归一,术语可跨词但不跨字幕段。</div>
+      <div class="row" style="margin-top:8px">
+        <button class="ghost" id="fillTermsExample" type="button">填入示例术语</button>
+      </div>
+      <div class="error" id="reviewError"></div>
+    </div>
+
+    <div class="panel">
       <h2>约束与权重</h2>
       <div class="grid2">
         <div><label>单行最大字符</label><input type="number" id="max_chars_per_line" value="42" min="5" max="200"></div>
@@ -149,6 +180,11 @@
   </div>
 
   <div>
+    <div class="panel" id="reviewPanel" style="display:none">
+      <h2>术语一致性审校(当前选中方案)</h2>
+      <div id="reviewResult"></div>
+    </div>
+
     <div class="panel">
       <h2>断句预览</h2>
       <div class="hint" style="margin-bottom:8px">点击段落右上角 <b>🔒 锁定</b> 可固定该段的词范围与内部换行;之后调整权重、边界约束或备选数量时,后端只优化其余区间,跨区间的 K-best 组合仍按全局总代价排序、按完整断点序列去重。再次点击可解锁。</div>
@@ -323,7 +359,11 @@ $("result").addEventListener("click", e => {
   const alt = e.target.closest("[data-alt]");
   if (alt && altPlans) {
     const i = +alt.dataset.alt;
-    if (i !== altIndex) renderPlan(i);
+    if (i !== altIndex) {
+      clearReview();
+      renderPlan(i);
+      scheduleReview();
+    }
     return;
   }
   const ulbtn = e.target.closest("[data-unlocklock]");
@@ -368,7 +408,8 @@ async function run() {
     $("parseError").textContent = e.message;
   }
   renderWordFlow(words, phrases);
-  if (!words.length) { $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>'; return; }
+  if (!words.length) { $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>'; clearReview(); return; }
+  lastWords = words;
 
   const cfg = {};
   for (const k of ["max_chars_per_line", "max_cps", "min_duration", "max_duration", "w_shot", "w_imbalance", "w_pause"])
@@ -393,8 +434,13 @@ async function run() {
     body: JSON.stringify({ words, phrases, shots, boundaries, locks, alternatives, config: cfg }),
   });
   const data = await res.json();
-  if (!res.ok) { $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`; return; }
+  if (!res.ok) {
+    clearReview();
+    $("result").innerHTML = `<div class="error">${escapeHtml(String(data.detail || "请求失败"))}</div>`;
+    return;
+  }
   render(data);
+  scheduleReview();
 }
 
 // 当前响应与选中的方案名次
@@ -455,6 +501,7 @@ function render(data) {
   altIndex = 0;
   const el = $("result");
   if (!data.ok) {
+    clearReview();
     clearBreakMarks();
     const c = data.conflict;
     const b = c.boundary;
@@ -537,15 +584,230 @@ function renderPlan(idx) {
         data-lock="${wa}-${wb}" data-locked="${isLocked ? 1 : 0}" data-lb="${lbAttr}"
         title="${isLocked ? "解锁该段,重算后恢复优化" : "锁定该段的词范围与内部换行,重算时保持不变"}">
         ${isLocked ? "解锁" : "🔒 锁定"}</button>`;
-      return `<div class="seg${diff ? " diffbreak" : ""}${isLocked ? " locked" : ""}">
+      return `<div class="seg${diff ? " diffbreak" : ""}${isLocked ? " locked" : ""}" data-seg="${i}">
       <div class="meta"><span>#${i + 1}</span><span>${fmt(s.start)} → ${fmt(s.end)}</span>
         <span>${s.duration}s</span><span>${s.cps} 字/秒</span><span>词 ${wa}–${wb}</span>${tag}${ltag}${lockBtn}</div>
-      <div class="lines">${s.lines.map(l => `<div>${escapeHtml(l)}</div>`).join("<br>")}</div>
+      <div class="lines">${markedLinesHtml(s, i)}<\/div>
       <div class="cost"><span>镜头 <b>${s.cost.shot}</b></span><span>行长 <b>${s.cost.imbalance}</b></span>
         <span>停顿 <b>${s.cost.pause}</b></span><span>合计 <b>${s.cost.total}</b></span></div>
     </div>`;
     }).join("");
 }
+
+// ── 术语一致性审校 ──
+let lastWords = [];
+let reviewData = null;      // 最近一次审校响应
+let reviewSig = "";         // 审校所针对方案的签名(word_range+line_break)
+let reviewRunId = 0;
+let reviewTimer = null;
+
+function parseGlossary(text) {
+  text = text.trim();
+  if (!text) return [];
+  if (text.startsWith("[")) {
+    const arr = JSON.parse(text);
+    if (!Array.isArray(arr)) throw new Error("术语 JSON 必须是数组");
+    return arr.map(o => ({
+      canonical: String(o.canonical ?? ""),
+      variants: Array.isArray(o.variants) ? o.variants.map(String) : [],
+    }));
+  }
+  const terms = [];
+  text.split("\n").forEach((line, i) => {
+    line = line.trim();
+    if (!line) return;
+    const m = line.match(/^([^=:]*)([=:])(.*)$/);
+    if (!m) {
+      throw new Error(`术语第 ${i + 1} 行格式错误,应为「规范写法 = 变体…」: ${line}`);
+    }
+    const canonical = m[1].trim();
+    const variants = m[3].split(/[,，;；|｜、/]/).map(s => s.trim()).filter(Boolean);
+    terms.push({ canonical, variants });
+  });
+  return terms;
+}
+
+function currentSegments() {
+  if (!curData || !curData.ok) return null;
+  return altPlans ? altPlans[altIndex].segments : curData.segments;
+}
+
+function planSig(segments) {
+  return JSON.stringify(segments.map(s => [s.word_range[0], s.word_range[1], s.line_break]));
+}
+
+function markedLineHtml(text, hits) {
+  if (!hits || !hits.length) return escapeHtml(text);
+  let html = "";
+  let pos = 0;
+  for (const h of hits) {
+    if (h.start < pos) continue;  // 兜底: 命中非重叠
+    html += escapeHtml(text.slice(pos, h.start));
+    const tip = h.kind === "variant"
+      ? `非规范变体,规范写法: ${h.canonical}` : `规范写法: ${h.canonical}`;
+    html += `<mark class="tm${h.kind === "variant" ? " var" : ""}" title="${escapeHtml(tip)}">`
+          + escapeHtml(text.slice(h.start, h.end)) + "</mark>";
+    pos = h.end;
+  }
+  return html + escapeHtml(text.slice(pos));
+}
+
+function markedLinesHtml(seg, segIndex) {
+  const lines = seg.lines;
+  let seghits = null;
+  if (reviewData && reviewSig === planSig(currentSegments())) {
+    const rs = reviewData.segments.find(x => x.index === segIndex);
+    if (rs && rs.lines.length === lines.length
+        && rs.lines.every((l, li) => l.text === lines[li])) {
+      seghits = rs.lines.map(l => l.hits);
+    }
+  }
+  return lines.map((l, li) =>
+    `<div>${seghits ? markedLineHtml(l, seghits[li]) : escapeHtml(l)}</div>`
+  ).join("<br>");
+}
+
+function clearReview(message) {
+  reviewData = null;
+  reviewSig = "";
+  $("reviewPanel").style.display = "none";
+  $("reviewError").textContent = message || "";
+}
+
+function scheduleReview() {
+  clearTimeout(reviewTimer);
+  reviewTimer = setTimeout(runReview, 300);
+}
+
+async function runReview() {
+  const runId = ++reviewRunId;
+  const segments = currentSegments();
+  let terms;
+  try {
+    terms = parseGlossary($("glossary").value);
+  } catch (e) {
+    clearReview();
+    $("reviewError").textContent = e.message;
+    renderPlan(altIndex);
+    return;
+  }
+  if (!terms.length || !segments || !lastWords.length) {
+    clearReview();
+    renderPlan(altIndex);
+    return;
+  }
+  const sig = planSig(segments);
+  const res = await fetch("/api/terms/review", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      words: lastWords,
+      segments: segments.map(s => ({ word_range: s.word_range, line_break: s.line_break })),
+      terms,
+    }),
+  });
+  const data = await res.json();
+  if (runId !== reviewRunId) return;  // 已有更新的审校请求, 丢弃过期响应
+  if (!res.ok) {
+    reviewData = null;
+    reviewSig = "";
+    let msg;
+    const d = data.detail;
+    if (d && typeof d === "object") {
+      if (d.type === "empty_canonical") {
+        msg = `术语表第 ${d.term_index + 1} 项(序号 ${d.term_index + 1})的规范写法为空,请补充规范写法;输入已保留。`;
+      } else if (d.type === "variant_conflict") {
+        msg = `变体归属冲突:归一写法「${d.surface}」同时归属于术语表第 ${d.term_indices.map(i => i + 1).join("、")} 项(序号 ${d.term_indices.map(i => i + 1).join("、")}),请删除或修改其中一个;输入已保留。`;
+      } else {
+        msg = JSON.stringify(d);
+      }
+    } else {
+      msg = String(d || "审校请求失败");
+    }
+    $("reviewPanel").style.display = "none";
+    $("reviewError").textContent = msg;
+    renderPlan(altIndex);
+    return;
+  }
+  $("reviewError").textContent = "";
+  reviewData = data;
+  reviewSig = sig;
+  renderReview(terms);
+  renderPlan(altIndex);
+}
+
+function renderReview(terms) {
+  $("reviewPanel").style.display = "";
+  const sm = reviewData.summary;
+  const rows = sm.by_term.map(r => {
+    const vs = r.variants.map(v => `<span class="v">${escapeHtml(v.variant)} ×${v.count}</span>`).join("、");
+    return `<tr><td><b>${escapeHtml(r.canonical)}</b></td><td>${r.hits}</td>
+      <td style="color:var(--ok)">${r.canonical_hits}</td>
+      <td>${r.variant_hits ? `<b class="v">${r.variant_hits}</b>${vs ? `　${vs}` : ""}` : 0}</td></tr>`;
+  }).join("");
+  const table = rows
+    ? `<table class="termtbl"><thead><tr><th>规范写法</th><th>命中</th><th>规范次数</th><th>变体次数</th></tr></thead><tbody>${rows}</tbody></table>`
+    : `<div class="hint" style="margin-top:6px">术语表中的术语在当前方案中均未出现。</div>`;
+  const items = reviewData.inconsistencies.map((it, i) => {
+    const seg = reviewData.segments[it.segment_index];
+    const lineText = seg ? seg.lines[it.line - 1].text : "";
+    const ctx = markedLineHtml(lineText,
+      (seg.lines[it.line - 1].hits || []).filter(h => h.start === it.start && h.end === it.end && h.term_index === it.term_index));
+    return `<li data-seg="${it.segment_index}" title="点击定位到第 ${it.segment_index + 1} 段">
+      <span class="hint">#${it.segment_index + 1} 段 · 第 ${it.line} 行</span>
+      <span class="vr">${escapeHtml(it.variant)}</span> → <span class="ar">${escapeHtml(it.canonical)}</span>
+      <div style="margin-top:3px">「${ctx}」</div></li>`;
+  }).join("");
+  const inc = items
+    ? `<div class="hint" style="margin-top:10px">不一致项(非规范变体,点击定位):</div><ul class="trlist">${items}</ul>`
+    : `<div style="color:var(--ok);font-size:12px;margin-top:10px">✓ 未发现非规范变体,术语用法一致。</div>`;
+  $("reviewResult").innerHTML = `
+    <div class="trsum">
+      <span class="chip">字幕段 <b>${sm.segments}</b></span>
+      <span class="chip">命中 <b>${sm.hits}</b></span>
+      <span class="chip ok">规范 <b>${sm.canonical_hits}</b></span>
+      <span class="chip bad">变体 <b>${sm.variant_hits}</b></span>
+      <button type="button" class="ghost" id="downloadReview" style="margin-left:auto;padding:4px 12px;font-size:12px">下载审校 JSON</button>
+    </div>
+    ${table}${inc}`;
+}
+
+$("reviewResult").addEventListener("click", e => {
+  if (e.target.closest("#downloadReview")) {
+    let terms = [];
+    try { terms = parseGlossary($("glossary").value); } catch (_) {}
+    const payload = Object.assign({
+      generated_at: new Date().toISOString(),
+      terms,
+    }, reviewData);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "terminology-review.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    return;
+  }
+  const li = e.target.closest("[data-seg]");
+  if (li) {
+    const el = document.querySelector(`#result .seg[data-seg="${li.dataset.seg}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.remove("flash");
+      void el.offsetWidth;
+      el.classList.add("flash");
+    }
+  }
+});
+
+$("glossary").addEventListener("input", scheduleReview);
+$("fillTermsExample").onclick = () => {
+  $("glossary").value = TERMS_EXAMPLE;
+  scheduleReview();
+};
+
+const TERMS_EXAMPLE = `咱们 = 我们
+动态规划 = DP, 动态 规划`;
 
 const EXAMPLE = `00:00:00.500 00:00:00.900 我们
 00:00:00.900 00:00:01.200 今天
